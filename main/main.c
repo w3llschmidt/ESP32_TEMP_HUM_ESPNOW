@@ -1,5 +1,5 @@
-// main.c — ESP32 SHT45 TEMP/HUM ESPNOW Sender
-// 25B Unified Frame; f1 = temp[°C], f2 = rh[%], f3 = 0, f4 = 0
+// main.c — ESP32-C6 + SHT45 via esp-idf-lib/sht4x
+// ESPNOW Unified 25B: svc="TMP ", f1=temp[°C], f2=rh[%], f3=0, f4=0
 
 #include <stdio.h>
 #include <string.h>
@@ -22,7 +22,9 @@
 #include "esp_log.h"
 #include "esp_check.h"
 
-#include "driver/i2c.h"
+// --- Sensor-Treiber (aus ESP-IDF Component Registry)
+#include "i2cdev.h"
+#include "sht4x.h"
 
 // ===================== Logging =====================
 static const char *TAG = "APP";
@@ -41,7 +43,7 @@ typedef struct {
 #pragma pack(pop)
 _Static_assert(sizeof(espnow_frame_t) == 25, "frame must be 25 bytes");
 
-// Service-Code als 4-Byte Literal
+// Service-Code
 #define SVC_TMP  { 'T','M','P',' ' }
 
 // ===================== Device Identity =====================
@@ -56,98 +58,36 @@ static uint8_t broadcastAddress[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 static esp_now_peer_info_t peerInfo;
 
 // ===================== I2C / SHT45 =====================
-// Qwiic Low-Power-I2C: IO6 = SDA, IO7 = SCL (siehe SparkFun Hookup Guide)
-#define I2C_PORT        I2C_NUM_0
-#define I2C_SDA_PIN     6
-#define I2C_SCL_PIN     7
-#define I2C_FREQ_HZ     100000
+// SparkFun Qwiic auf IO6/IO7
+#define I2C_SDA_PIN 6
+#define I2C_SCL_PIN 7
 
-#define SHT4X_I2C_ADDR          0x44
-#define SHT4X_CMD_MEAS_HIGH_PREC 0xFD
+static sht4x_t sht;   // Geräte-Descriptor (vom Treiber)
 
-static esp_err_t i2c_init(void)
+// Sensor init (über esp-idf-lib)
+static esp_err_t sht45_init(void)
 {
-    i2c_config_t cfg = {
-        .mode = I2C_MODE_MASTER,
-        .sda_io_num = I2C_SDA_PIN,
-        .scl_io_num = I2C_SCL_PIN,
-        .sda_pullup_en = GPIO_PULLUP_DISABLE, // externe Pullups auf dem Board
-        .scl_pullup_en = GPIO_PULLUP_DISABLE,
-        .master.clk_speed = I2C_FREQ_HZ,
-        .clk_flags = 0
-    };
-    ESP_ERROR_CHECK(i2c_param_config(I2C_PORT, &cfg));
-    ESP_ERROR_CHECK(i2c_driver_install(I2C_PORT, cfg.mode, 0, 0, 0));
-    ESP_LOGI(TAG, "I2C init done (SDA=%d, SCL=%d)", I2C_SDA_PIN, I2C_SCL_PIN);
+    // i2cdev-Helper initialisieren (setzt I²C-Pins beim Desc-Init)
+    ESP_RETURN_ON_ERROR(i2cdev_init(), TAG, "i2cdev_init");
+
+    // Descriptor auf Port 0, Pins 6/7
+    ESP_RETURN_ON_ERROR(sht4x_init_desc(&sht, I2C_NUM_0, I2C_SDA_PIN, I2C_SCL_PIN),
+                        TAG, "sht4x_init_desc");
+    // Sensor initialisieren
+    ESP_RETURN_ON_ERROR(sht4x_init(&sht), TAG, "sht4x_init");
+
+    // Defaults: High Repeatability, Heater aus (kann man setzen, falls gewünscht)
+    sht.repeatability = SHT4X_HIGH;        // präzise Messung
+    sht.heater        = SHT4X_HEATER_OFF;  // kein Heater
+
+    ESP_LOGI(TAG, "SHT45 ready on I2C0 SDA=%d SCL=%d", I2C_SDA_PIN, I2C_SCL_PIN);
     return ESP_OK;
 }
 
-// CRC-8 nach Sensirion (Poly 0x31, Init 0xFF, kein Final-XOR)
-static uint8_t sht4x_crc(const uint8_t *data, size_t len)
+// eine Messung T/RH holen
+static esp_err_t sht45_read(float *t_c, float *rh)
 {
-    uint8_t crc = 0xFF;
-    for (size_t i = 0; i < len; i++) {
-        crc ^= data[i];
-        for (int b = 0; b < 8; b++) {
-            if (crc & 0x80) {
-                crc = (uint8_t)((crc << 1) ^ 0x31);
-            } else {
-                crc <<= 1;
-            }
-        }
-    }
-    return crc;
-}
-
-// eine Messung T/RH holen, Umrechnung nach Datasheet
-static esp_err_t sht45_read(float *out_temp_c, float *out_rh)
-{
-    if (!out_temp_c || !out_rh) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    uint8_t cmd = SHT4X_CMD_MEAS_HIGH_PREC;
-    esp_err_t err = i2c_master_write_to_device(
-        I2C_PORT, SHT4X_I2C_ADDR, &cmd, 1, pdMS_TO_TICKS(20)
-    );
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    // Messdauer high precision ~9 ms -> konservativ 15 ms warten
-    vTaskDelay(pdMS_TO_TICKS(15));
-
-    uint8_t buf[6] = {0};
-    err = i2c_master_read_from_device(
-        I2C_PORT, SHT4X_I2C_ADDR, buf, sizeof(buf), pdMS_TO_TICKS(20)
-    );
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    // CRC prüfen
-    if (sht4x_crc(&buf[0], 2) != buf[2] || sht4x_crc(&buf[3], 2) != buf[5]) {
-        return ESP_ERR_INVALID_CRC;
-    }
-
-    uint16_t raw_t  = ((uint16_t)buf[0] << 8) | buf[1];
-    uint16_t raw_rh = ((uint16_t)buf[3] << 8) | buf[4];
-
-    // Formeln aus SHT4x-Datenblatt:
-    // T[°C] = -45 + 175 * ST / (2^16 - 1)
-    // RH[%] = -6  + 125 * SRH / (2^16 - 1)
-    const float scale = 1.0f / 65535.0f;
-
-    float t  = -45.0f + 175.0f * ((float)raw_t  * scale);
-    float rh =  -6.0f + 125.0f * ((float)raw_rh * scale);
-
-    // grob auf 0..100 % begrenzen
-    if (rh < 0.0f)   rh = 0.0f;
-    if (rh > 100.0f) rh = 100.0f;
-
-    *out_temp_c = t;
-    *out_rh     = rh;
-    return ESP_OK;
+    return sht4x_measure(&sht, t_c, rh);
 }
 
 // ===================== Utils =====================
@@ -156,7 +96,6 @@ static uint32_t fnv1a32(const uint8_t *d, size_t n) {
     for (size_t i = 0; i < n; i++) { h ^= d[i]; h *= 16777619u; }
     return h;
 }
-
 static uint32_t stable_offset_ms_from_mac(void) {
     uint8_t mac[6]; esp_read_mac(mac, ESP_MAC_WIFI_STA);
     return fnv1a32(mac, 6) % (JITTER_MAX_MS + 1);
@@ -175,24 +114,15 @@ static void init_wifi(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
 
     // Deutschland, explizit 1..13
-    wifi_country_t country = {
-        .cc     = "DE",
-        .schan  = 1,
-        .nchan  = 13,
-        .policy = WIFI_COUNTRY_POLICY_MANUAL
-    };
+    wifi_country_t country = { .cc = "DE", .schan = 1, .nchan = 13, .policy = WIFI_COUNTRY_POLICY_MANUAL };
     ESP_ERROR_CHECK(esp_wifi_set_country(&country));
     ESP_ERROR_CHECK(esp_wifi_start());
 
     // fester Kanal 1
     ESP_ERROR_CHECK(esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE));
 
-    // 11b/g/n
-    ESP_ERROR_CHECK(esp_wifi_set_protocol(
-        WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N
-    ));
-
-    // 20 MHz, kein Powersave
+    // 11b/g/n, 20 MHz, kein Powersave
+    ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N));
     ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20));
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
@@ -234,14 +164,11 @@ static void mainloop(void *arg)
     vTaskDelay(pdMS_TO_TICKS(first_offset_ms));
 
     for (;;) {
-        float temp_c = 0.0f;
-        float rh     = 0.0f;
+        float temp_c = 0.0f, rh = 0.0f;
 
         esp_err_t err_sht = sht45_read(&temp_c, &rh);
         if (err_sht != ESP_OK) {
-            ESP_LOGW(TAG, "SHT45 read failed: %s (%d)",
-                     esp_err_to_name(err_sht), (int)err_sht);
-            // Im Fehlerfall senden wir 0/0, damit Frame-Format stabil bleibt
+            ESP_LOGW(TAG, "SHT45 read failed: %s (%d)", esp_err_to_name(err_sht), (int)err_sht);
             temp_c = 0.0f;
             rh     = 0.0f;
         }
@@ -274,9 +201,13 @@ static void mainloop(void *arg)
 // ===================== app_main =====================
 void app_main(void)
 {
-    // Log-Spam reduzieren
     esp_log_level_set("gpio", ESP_LOG_WARN);
+    esp_log_level_set("i2c.master", ESP_LOG_ERROR);
 
+    esp_log_level_set("wifi",      ESP_LOG_ERROR); // oder ESP_LOG_WARN
+    esp_log_level_set("phy_init",  ESP_LOG_ERROR);
+    esp_log_level_set("coexist",   ESP_LOG_ERROR);
+ 
     // NVS initialisieren
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -285,10 +216,11 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    // I2C / SHT45
-    ESP_ERROR_CHECK(i2c_init());
+    // Sensor/I2C
+    ESP_ERROR_CHECK(sht45_init());
 
     // WiFi/ESPNOW
+
     init_wifi();
     init_espnow();
 
@@ -302,5 +234,5 @@ void app_main(void)
     // Task starten
     xTaskCreatePinnedToCore(mainloop, "mainloop", 4096, NULL, 4, NULL, 0);
 
-    vTaskSuspend(NULL);
+vTaskSuspend(NULL);
 }
