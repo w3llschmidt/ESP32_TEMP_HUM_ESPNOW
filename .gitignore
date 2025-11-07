@@ -1,0 +1,36 @@
+# --- ESP-IDF build output ---
+/build/
+/build-*/
+.cmake/
+CMakeFiles/
+CMakeCache.txt
+*.cmake
+*.elf
+*.map
+*.bin
+*.a
+*.o
+*.obj
+*.d
+*.ld
+*.log
+
+# IDF Component manager (generiert)
+#/managed_components/        # meist nicht versionieren
+managed_components/
+
+# SDK config Backup (Original 'sdkconfig' i.d.R. versionieren)
+sdkconfig.old
+
+# IDEs
+.vscode/
+.vscode-*/
+.idea/
+*.iml
+
+# OS / Misc
+.DS_Store
+Thumbs.db
+__pycache__/
+*.pyc
+*~
